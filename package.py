@@ -5,26 +5,27 @@ import sys
 if sys.version_info < (3, 6):
     raise RuntimeError("A python version 3.6 or newer is required")
 
-import os
-import re
-import time
-import stat
-import json
-import shlex
-import shutil
-import hashlib
-import zipfile
 import argparse
 import datetime
-import tempfile
-import operator
-import platform
-import subprocess
-from subprocess import check_call, check_output
-from contextlib import contextmanager
-from base64 import b64encode
+import hashlib
+import json
 import logging
+import operator
+import os
+import platform
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import tempfile
+import time
+import zipfile
+from base64 import b64encode
+from contextlib import contextmanager
+from subprocess import check_call, check_output
 
+PY311 = sys.version_info >= (3, 11)
 PY38 = sys.version_info >= (3, 8)
 PY37 = sys.version_info >= (3, 7)
 PY36 = sys.version_info >= (3, 6)
@@ -638,17 +639,45 @@ class ZipContentFilter:
                     yield from emit_file(f, o)
 
 
-def get_build_system_from_pyproject_toml(pyproject_file):
+def get_build_system_from_pyproject_toml_manual(pyproject_file):
     # Implement a basic TOML parser because python stdlib does not provide toml support and we probably do not want to add external dependencies
-    if os.path.isfile(pyproject_file):
-        with open(pyproject_file) as f:
-            bs = False
-            for line in f.readlines():
-                if line.startswith("[build-system]"):
-                    bs = True
-                    continue
-                if bs and line.startswith("build-backend") and "poetry" in line:
-                    return "poetry"
+    if not os.path.isfile(pyproject_file):
+        return None
+
+    with open(pyproject_file) as f:
+        bs = False
+        for line in f.readlines():
+            if line.startswith("[build-system]"):
+                bs = True
+                continue
+            if not (bs and line.startswith("build-backend")):
+                continue
+            if "poetry" in line:
+                return "poetry"
+            if "hatchling.build" in line or "uv_build" in line:
+                return "uv"
+
+
+def get_build_system_from_pyproject_toml_stdlib(pyproject_file):
+    import tomllib
+
+    with open(pyproject_file, "rb") as f:
+        data = tomllib.load(f)
+    build_backend = data.get("build-system", {}).get("build-backend", "")
+
+    if not build_backend:
+        return None
+    if "poetry" in build_backend:
+        return "poetry"
+    if build_backend in {"hatchling.build", "uv_build"}:
+        return "uv"
+    return None
+
+
+def get_build_system_from_pyproject_toml(pyproject_file):
+    if not PY311:
+        return get_build_system_from_pyproject_toml_manual(pyproject_file)
+    return get_build_system_from_pyproject_toml_stdlib(pyproject_file)
 
 
 class BuildPlanManager:
@@ -727,6 +756,38 @@ class BuildPlanManager:
                 poetry_toml_file = os.path.join(pyproject_path, "poetry.toml")
                 if os.path.isfile(poetry_toml_file):
                     hash(poetry_toml_file)
+
+        def uv_install_step(
+            path,
+            uv_export_extra_args=[],
+            uv_install_extra_args=[],
+            prefix=None,
+            required=False,
+            tmp_dir=None,
+        ):
+            pyproject_file = path
+            if os.path.isdir(path):
+                pyproject_file = os.path.join(path, "pyproject.toml")
+            if get_build_system_from_pyproject_toml(pyproject_file) != "uv":
+                if required:
+                    raise RuntimeError(
+                        "uv configuration not found: {}".format(pyproject_file)
+                    )
+            else:
+                step(
+                    "uv",
+                    runtime,
+                    path,
+                    uv_export_extra_args,
+                    uv_install_extra_args,
+                    prefix,
+                    tmp_dir,
+                )
+                hash(pyproject_file)
+                pyproject_path = os.path.dirname(pyproject_file)
+                uv_lock_file = os.path.join(pyproject_path, "uv.lock")
+                if os.path.isfile(uv_lock_file):
+                    hash(uv_lock_file)
 
         def npm_requirements_step(path, prefix=None, required=False, tmp_dir=None):
             command = "npm"
@@ -811,6 +872,7 @@ class BuildPlanManager:
                 if runtime.startswith("python"):
                     pip_requirements_step(os.path.join(path, "requirements.txt"))
                     poetry_install_step(path)
+                    uv_install_step(path)
                 elif runtime.startswith("nodejs"):
                     npm_requirements_step(os.path.join(path, "package.json"))
                 step("zip", path, None)
@@ -829,6 +891,9 @@ class BuildPlanManager:
                     pip_requirements = claim.get("pip_requirements")
                     poetry_install = claim.get("poetry_install")
                     poetry_export_extra_args = claim.get("poetry_export_extra_args", [])
+                    uv_install = claim.get("uv_install")
+                    uv_install_extra_args = claim.get("uv_install_extra_args", [])
+                    uv_export_extra_args = claim.get("uv_export_extra_args", [])
                     npm_requirements = claim.get(
                         "npm_requirements", claim.get("npm_package_json")
                     )
@@ -858,6 +923,17 @@ class BuildPlanManager:
                                 poetry_export_extra_args=poetry_export_extra_args,
                                 required=True,
                                 tmp_dir=claim.get("poetry_tmp_dir"),
+                            )
+
+                    if uv_install and runtime.startswith("python"):
+                        if path:
+                            uv_install_step(
+                                path,
+                                prefix=prefix,
+                                uv_export_extra_args=uv_export_extra_args,
+                                uv_install_extra_args=uv_install_extra_args,
+                                required=True,
+                                tmp_dir=claim.get("uv_tmp_dir"),
                             )
 
                     if npm_requirements and runtime.startswith("nodejs"):
@@ -964,6 +1040,30 @@ class BuildPlanManager:
                     log.info("poetry_export_extra_args: %s", poetry_export_extra_args)
                     with install_poetry_dependencies(
                         query, path, poetry_export_extra_args, tmp_dir
+                    ) as rd:
+                        if rd:
+                            if pf:
+                                self._zip_write_with_filter(
+                                    zs, pf, rd, prefix, timestamp=0
+                                )
+                            else:
+                                # XXX: timestamp=0 - what actually do with it?
+                                zs.write_dirs(rd, prefix=prefix, timestamp=0)
+                elif cmd == "uv":
+                    (
+                        runtime,
+                        path,
+                        uv_export_extra_args,
+                        uv_install_extra_args,
+                        prefix,
+                        tmp_dir,
+                    ) = action[1:]
+                    with install_uv_dependencies(
+                        query,
+                        path,
+                        uv_export_extra_args,
+                        uv_install_extra_args,
+                        tmp_dir,
                     ) as rd:
                         if rd:
                             if pf:
@@ -1358,6 +1458,153 @@ def install_poetry_dependencies(query, path, poetry_export_extra_args, tmp_dir):
 
 
 @contextmanager
+def install_uv_dependencies(
+    query, path, uv_export_extra_args, uv_install_extra_args, tmp_dir
+):
+    # TODO:
+    #  1. Emit files instead of temp_dir
+
+    # pyproject.toml is always required by uv
+    pyproject_file = path
+    if os.path.isdir(path):
+        pyproject_file = os.path.join(path, "pyproject.toml")
+    if not os.path.exists(pyproject_file):
+        yield
+        return
+
+    # uv.lock is optional
+    pyproject_path = os.path.dirname(pyproject_file)
+    uv_lock_file = os.path.join(pyproject_path, "uv.lock")
+
+    runtime = query.runtime
+    artifacts_dir = query.artifacts_dir
+    docker = query.docker
+    docker_image_tag_id = None
+
+    if docker:
+        docker_file = docker.docker_file
+        docker_image = docker.docker_image
+        docker_build_root = docker.docker_build_root
+
+        if docker_image:
+            ok = False
+            while True:
+                output = check_output(docker_image_id_command(docker_image))
+                if output:
+                    docker_image_tag_id = output.decode().strip()
+                    log.debug(
+                        "DOCKER TAG ID: %s -> %s", docker_image, docker_image_tag_id
+                    )
+                    ok = True
+                if ok:
+                    break
+                docker_cmd = docker_build_command(
+                    build_root=docker_build_root,
+                    docker_file=docker_file,
+                    tag=docker_image,
+                )
+                check_call(docker_cmd)
+                ok = True
+        elif docker_file or docker_build_root:
+            raise ValueError(
+                "docker_image must be specified for a custom image future references"
+            )
+
+    working_dir = os.getcwd()
+
+    log.info("Installing python dependencies with uv: %s", uv_lock_file)
+    with tempdir(tmp_dir) as temp_dir:
+
+        def copy_file_to_target(file, temp_dir):
+            filename = os.path.basename(file)
+            target_file = os.path.join(temp_dir, filename)
+            shutil.copyfile(file, target_file)
+            return target_file
+
+        pyproject_target_file = copy_file_to_target(pyproject_file, temp_dir)
+
+        if os.path.isfile(uv_lock_file):
+            log.info("Using uv.lock file: %s", uv_lock_file)
+            uv_lock_target_file = copy_file_to_target(uv_lock_file, temp_dir)
+        else:
+            uv_lock_target_file = None
+
+        uv_exec = "uv"
+        subproc_env = None
+
+        if not docker:
+            if WINDOWS:
+                uv_exec = "uv.bat"
+
+        # Install dependencies into the temporary directory.
+        with cd(temp_dir):
+            # NOTE: uv must be available in the build environment
+            uv_export = [
+                uv_exec,
+                "export",
+                "--format",
+                "requirements.txt",
+                "--output",
+                "requirements.txt",
+                "--with-credentials",
+            ] + uv_export_extra_args
+
+            uv_commands = [
+                uv_export,
+                [
+                    uv_exec,
+                    "pip",
+                    "install",
+                    "--no-compile",
+                    "--prefix=",
+                    "--target=.",
+                    "--requirement=requirements.txt",
+                ]
+                + uv_install_extra_args,
+            ]
+            if docker:
+                with_ssh_agent = docker.with_ssh_agent
+                uv_cache_dir = docker.docker_uv_cache
+                if uv_cache_dir:
+                    if isinstance(uv_cache_dir, str):
+                        uv_cache_dir = os.path.abspath(
+                            os.path.join(working_dir, uv_cache_dir)
+                        )
+                    else:
+                        uv_cache_dir = os.path.abspath(
+                            os.path.join(working_dir, artifacts_dir, "cache/uv")
+                        )
+
+                chown_mask = "{}:{}".format(os.getuid(), os.getgid())
+                uv_commands += [["chown", "-R", chown_mask, "."]]
+                shell_commands = [shlex_join(uv_command) for uv_command in uv_commands]
+                shell_command = [" && ".join(shell_commands)]
+                check_call(
+                    docker_run_command(
+                        ".",
+                        shell_command,
+                        runtime,
+                        image=docker_image_tag_id,
+                        shell=True,
+                        ssh_agent=with_ssh_agent,
+                        uv_cache_dir=uv_cache_dir,
+                        docker=docker,
+                    )
+                )
+            else:
+                cmd_log.info(uv_commands)
+                log_handler and log_handler.flush()
+                for uv_command in uv_commands:
+                    check_call(uv_command, env=subproc_env)
+
+            os.remove(pyproject_target_file)
+            if uv_lock_target_file:
+                os.remove(uv_lock_target_file)
+
+            yield temp_dir
+
+
+@contextmanager
 def install_npm_requirements(query, requirements_file, tmp_dir):
     # TODO:
     #  1. Emit files instead of temp_dir
@@ -1548,6 +1795,7 @@ def docker_run_command(
     interactive=False,
     pip_cache_dir=None,
     poetry_cache_dir=None,
+    uv_cache_dir=None,
     docker=None,
 ):
     """"""
@@ -1615,6 +1863,14 @@ def docker_run_command(
                 [
                     "-v",
                     "{}:/root/.cache/pypoetry:z".format(poetry_cache_dir),
+                ]
+            )
+        if uv_cache_dir:
+            uv_cache_dir = os.path.abspath(uv_cache_dir)
+            docker_cmd.extend(
+                [
+                    "-v",
+                    "{}:/root/.cache/uv:z".format(uv_cache_dir),
                 ]
             )
 

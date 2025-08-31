@@ -1,19 +1,35 @@
-from package import get_build_system_from_pyproject_toml, BuildPlanManager
-from pytest import raises
 from unittest.mock import Mock
 
+import pytest
+from pytest import raises
 
-def test_get_build_system_from_pyproject_toml_inexistent():
-    assert (
-        get_build_system_from_pyproject_toml("fixtures/inexistent/pyproject.toml")
-        is None
-    )
+from package import (
+    BuildPlanManager,
+    get_build_system_from_pyproject_toml_manual,
+    get_build_system_from_pyproject_toml_stdlib,
+)
 
 
-def test_get_build_system_from_pyproject_toml_unknown():
-    assert (
-        get_build_system_from_pyproject_toml("fixtures/pyproject-unknown.toml") is None
-    )
+@pytest.mark.parametrize(
+    "parser",
+    [
+        get_build_system_from_pyproject_toml_manual,
+        get_build_system_from_pyproject_toml_stdlib,
+    ],
+)
+def test_get_build_system_from_pyproject_toml_manual_inexistent(parser):
+    assert parser("fixtures/inexistent/pyproject.toml") is None
+
+
+@pytest.mark.parametrize(
+    "parser",
+    [
+        get_build_system_from_pyproject_toml_manual,
+        get_build_system_from_pyproject_toml_stdlib,
+    ],
+)
+def test_get_build_system_from_pyproject_toml_manual_unknown(parser):
+    assert parser("fixtures/pyproject-unknown.toml") is None
 
 
 def test_build_manager_sucess_command():
@@ -32,10 +48,23 @@ def test_build_manager_failing_command():
         )
 
 
-def test_get_build_system_from_pyproject_toml_poetry():
-    assert (
-        get_build_system_from_pyproject_toml(
-            "examples/fixtures/python-app-poetry/pyproject.toml"
-        )
-        == "poetry"
-    )
+@pytest.mark.parametrize(
+    "parser",
+    [
+        get_build_system_from_pyproject_toml_manual,
+        get_build_system_from_pyproject_toml_stdlib,
+    ],
+)
+def test_get_build_system_from_pyproject_toml_manual_poetry(parser):
+    assert parser("examples/fixtures/python-app-poetry/pyproject.toml") == "poetry"
+
+
+@pytest.mark.parametrize(
+    "parser",
+    [
+        get_build_system_from_pyproject_toml_manual,
+        get_build_system_from_pyproject_toml_stdlib,
+    ],
+)
+def test_get_build_system_from_pyproject_toml_manual_uv(parser):
+    assert parser("examples/fixtures/python-app-uv/pyproject.toml") == "uv"
